@@ -9,32 +9,32 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Signal chain (per audio session), inside Android's DynamicsProcessing effect (32-bit float,
- * so nothing clips *inside* the chain however hot it gets):
+ * Signal chain (per audio session), inside Android's DynamicsProcessing effect (32-bit float):
  *
- *   input gain (BOOST) → pre-EQ (parametric) → 4-band compressor (density, exciter, warmth)
- *   → linked limiter → output
+ *   input gain (auto, up to the BOOST slider) → pre-EQ (parametric) → 4-band compressor
+ *   (density, exciter, warmth) → safety-net limiter → output
  *
- * WHY OTHER BOOSTER APPS CLIP
- * ---------------------------
- * In AOSP (DPFrequency.cpp) the DynamicsProcessing limiter is block-based: its detector is the
- * RMS energy of each ~10–20 ms FFT block, and there's no look-ahead. A limiter set to "-1 dB"
- * therefore holds the block RMS at -1 dB while the real sample peaks inside that block sit
- * 6–18 dB higher (the music's crest factor). Push the boost and those peaks get past 0 dBFS
- * and are hard-clipped at the output. Simulating that limiter on test music at +20 dB gives
- * sample peaks of +12 to +14 dBFS with 2–5 % of samples clipped.
+ * WHY A PLAIN LIMITER ISN'T ENOUGH
+ * AOSP's DynamicsProcessing limiter (DPFrequency.cpp) measures the RMS energy of 10–20 ms
+ * blocks, with no look-ahead. Sample peaks sit 6–18 dB above that RMS, so "limit at −1 dB"
+ * still lets peaks reach +12 dBFS and clip. Lowering the limiter enough to stop that
+ * squashes loud songs and makes everything QUIETER.
  *
- * WHAT WE DO: CLIP GUARD
- * ----------------------
- * The limiter threshold is set to   ceiling − crestMargin,   where crestMargin is learned live:
- *  - the Visualizer API reports output peak and RMS every 50 ms; their difference is the
- *    program's crest factor. We keep a 60 s memory of it and size the margin from the worst case.
- *  - if a measured peak ever gets near the ceiling, the margin jumps up immediately.
- *  - the margin relaxes slowly (0.5 dB/s) so the loop never chases its own tail.
- * With no meter available, a fixed conservative 18 dB margin is used.
- * Simulated against the AOSP limiter algorithm at +6…+30 dB boost: zero clipped samples,
- * peaks held below the ceiling. Because the gain is applied per block (whole-frame scaling,
- * smooth overlap-add), the waveform of a transient is scaled, never flattened.
+ * CLIP GUARD = MEASURED GAIN CONTROL
+ * The Visualizer API reports the real output peak every 50 ms. The boost actually applied is
+ *   gain = min(slider, ceiling − 0.5 dB − loudest source peak in the last 30 s)
+ * so the music is raised exactly as far as it has room to go, and never below 0 dB
+ * (the app never makes anything quieter). The gain drops immediately if a peak gets near the
+ * ceiling or the limiter starts working, and rises at 2 dB/s. The limiter is only a safety net
+ * for sudden jumps (e.g. a quiet song followed by a loud one): its threshold is
+ * ceiling − min(15, gain + 3) dB, so with no boost it's out of the way.
+ *
+ * ORDERING MATTERS: when two effects both claim "insert last" on the output mix, Android puts
+ * the newer one BEFORE the older one (EffectChain::getInsertIndex_l). The Visualizer must
+ * therefore be created before the global DynamicsProcessing so it measures the boosted output.
+ *
+ * Simulated against the AOSP limiter algorithm: never quieter than the original, +4…+12 dB
+ * louder where there's headroom, zero clipped samples in every realistic case.
  */
 class AudioEngine {
 
@@ -43,11 +43,12 @@ class AudioEngine {
     private var visualizer: Visualizer? = null
 
     // ---- Clip Guard state (read by the UI)
-    @Volatile var crestMarginDb = START_MARGIN_DB; private set
+    @Volatile var gainDb = 0f; private set
     @Volatile var lastPeakDb: Float? = null; private set
     @Volatile var maxPeakDb = -96f; private set
-    private val crestHistory = ArrayDeque<Float>()
-    private var appliedMarginDb = Float.NaN
+    @Volatile var limiterActive = false; private set
+    private val srcPeaks = ArrayDeque<Float>()
+    private var pushedGainDb = Float.NaN
     private var retryTicks = 0
 
     companion object {
@@ -58,32 +59,31 @@ class AudioEngine {
 
         private val MBC_EDGES = floatArrayOf(150f, 1200f, 6000f, 20000f)
 
-        /** Instant attack: the envelope follows each block's energy with no lag, so a transient
-         *  is limited in the same block it arrives in. Release 80 ms avoids pumping. */
         private const val LIMITER_ATTACK_MS = 0.01f
         private const val LIMITER_RELEASE_MS = 80f
         private const val LIMITER_RATIO = 1000f   // effectively ∞:1
 
-        // Clip Guard tuning (values validated in simulation, see README)
+        // Clip Guard tuning (validated in simulation, see clip_simulation.py / README)
         const val TICK_MS = 50L
-        private const val START_MARGIN_DB = 18f   // also the fixed fallback without a meter
-        private const val MIN_MARGIN_DB = 4f
-        private const val MAX_MARGIN_DB = 30f
-        private const val CREST_WEIGHT = 0.8f
-        private const val GUARD_DB = 0.3f
-        private const val STEP_UP_DB = 1.5f
-        private const val RELAX_DB_PER_S = 0.5f
-        private const val HISTORY_TICKS = (60_000 / TICK_MS).toInt()
+        private const val HEADROOM_DB = 0.5f        // aim this far under the ceiling
+        private const val GUARD_DB = 0.3f           // peak this close to ceiling → cut now
+        private const val STEP_DOWN_DB = 1.5f
+        private const val RISE_DB_PER_S = 2f
+        private const val BACKSTOP_DB = 15f
+        private const val BACKSTOP_MIN_DB = 3f
+        private const val LIMITER_DETECT_DB = 3f
+        private const val HISTORY_TICKS = (30_000 / TICK_MS).toInt()
     }
 
     @Synchronized
     fun update(s: BoostSettings) {
         settings = s
         if (!s.enabled) { releaseAll(); return }
+        setMeter(s.clipGuard)                        // meter FIRST (see ORDERING above)
+        if (!meterAvailable) gainDb = s.boostDb      // no meter: plain boost, not guarded
+        gainDb = min(gainDb, s.boostDb)
         if (s.globalMode) attach(GLOBAL_SESSION) else detach(GLOBAL_SESSION)
         sessions.values.forEach { apply(it, s) }
-        setMeter(s.clipGuard)
-        if (!s.clipGuard) crestMarginDb = START_MARGIN_DB
     }
 
     @Synchronized
@@ -129,28 +129,48 @@ class AudioEngine {
         val peak = m.mPeak / 100f
         val rms = m.mRms / 100f
         lastPeakDb = peak
+        if (peak < -70f) return                        // silence: hold everything
         maxPeakDb = max(maxPeakDb, peak)
 
-        if (rms > -60f) {                       // ignore silence
-            crestHistory.addLast(peak - rms)
-            while (crestHistory.size > HISTORY_TICKS) crestHistory.removeFirst()
-        }
-        val crest = CREST_WEIGHT * (crestHistory.maxOrNull() ?: START_MARGIN_DB)
-        val target = crest.coerceIn(MIN_MARGIN_DB, MAX_MARGIN_DB)
-
-        var margin = crestMarginDb
         val ceiling = settings.ceilingDb
-        if (peak > ceiling - GUARD_DB) {        // reactive: something got close — back off now
-            margin = min(margin + (peak - ceiling) + STEP_UP_DB, MAX_MARGIN_DB)
-        }
-        margin = if (target > margin) target
-                 else max(margin - RELAX_DB_PER_S * TICK_MS / 1000f, target)
-        crestMarginDb = margin
+        var g = gainDb
 
-        if (appliedMarginDb.isNaN() || abs(margin - appliedMarginDb) >= 0.1f) {
-            val lim = buildLimiter(settings)
-            sessions.values.forEach { runCatching { it.setLimiterAllChannelsTo(lim) } }
+        // Loudest source peak recently = measured output peak minus the gain we applied.
+        pushPeak(peak - g)
+        limiterActive = g > 0f && rms > limiterThreshold(g) - LIMITER_DETECT_DB
+        if (limiterActive) pushPeak(ceiling - HEADROOM_DB - (g - 1f))   // pull gain down
+
+        val target = (ceiling - HEADROOM_DB - (srcPeaks.maxOrNull() ?: 0f))
+            .coerceIn(0f, settings.boostDb)
+
+        if (peak > ceiling - GUARD_DB) g = max(0f, g - (peak - ceiling) - STEP_DOWN_DB)
+        g = if (target < g) target else min(target, g + RISE_DB_PER_S * TICK_MS / 1000f)
+        gainDb = g
+
+        if (pushedGainDb.isNaN() || abs(g - pushedGainDb) >= 0.05f) pushGain()
+    }
+
+    private fun pushPeak(v: Float) {
+        srcPeaks.addLast(v)
+        while (srcPeaks.size > HISTORY_TICKS) srcPeaks.removeFirst()
+    }
+
+    private fun pushGain() {
+        pushedGainDb = gainDb
+        val lim = buildLimiter(settings)
+        sessions.values.forEach {
+            runCatching {
+                it.setInputGainAllChannelsTo(gainDb)
+                it.setLimiterAllChannelsTo(lim)
+            }
         }
+    }
+
+    private fun limiterThreshold(g: Float): Float {
+        val ceiling = settings.ceilingDb.coerceIn(-12f, -0.1f)
+        // Without the meter there's no gain loop, so keep the limiter high (plain booster mode).
+        return if (visualizer == null) ceiling - BACKSTOP_MIN_DB
+               else ceiling - min(BACKSTOP_DB, g + BACKSTOP_MIN_DB)
     }
 
     fun resetMaxPeak() { maxPeakDb = -96f }
@@ -166,7 +186,7 @@ class AudioEngine {
             /* limiter*/ true,
         ).setPreferredFrameDuration(10f)
 
-        b.setInputGainAllChannelsTo(s.boostDb)
+        b.setInputGainAllChannelsTo(gainDb)
         b.setPreEqAllChannelsTo(buildEq(s))
         b.setMbcAllChannelsTo(buildMbc(s))
         b.setLimiterAllChannelsTo(buildLimiter(s))
@@ -175,7 +195,7 @@ class AudioEngine {
 
     private fun apply(dp: DynamicsProcessing, s: BoostSettings) {
         try {
-            dp.setInputGainAllChannelsTo(s.boostDb)
+            dp.setInputGainAllChannelsTo(gainDb)
             val gains = ParametricEq.engineGains(s.bands)
             for (i in gains.indices) {
                 dp.setPreEqBandAllChannelsTo(i, EqBand(true, ParametricEq.bandEdges[i], gains[i]))
@@ -244,17 +264,13 @@ class AudioEngine {
         )
     }
 
-    private fun buildLimiter(s: BoostSettings): Limiter {
-        val margin = if (s.clipGuard && visualizer != null) crestMarginDb else START_MARGIN_DB
-        appliedMarginDb = margin
-        return Limiter(
-            true, true,
-            /* linkGroup */ 0,                 // channels linked → stereo image never shifts
-            LIMITER_ATTACK_MS, LIMITER_RELEASE_MS, LIMITER_RATIO,
-            /* threshold */ s.ceilingDb.coerceIn(-12f, -0.1f) - margin,
-            /* postGain  */ 0f,                // nothing after the limiter may add gain
-        )
-    }
+    private fun buildLimiter(s: BoostSettings) = Limiter(
+        true, true,
+        /* linkGroup */ 0,                 // channels linked → stereo image never shifts
+        LIMITER_ATTACK_MS, LIMITER_RELEASE_MS, LIMITER_RATIO,
+        /* threshold */ limiterThreshold(gainDb),
+        /* postGain  */ 0f,                // nothing after the limiter may add gain
+    )
 
     // ---------------------------------------------------------------- meter
 
@@ -266,6 +282,13 @@ class AudioEngine {
                     setEnabled(true)
                 }
             }.onFailure { Log.w(TAG, "Meter unavailable (RECORD_AUDIO not granted?)", it) }.getOrNull()
+            if (visualizer != null) {
+                // Start guarded from 0 dB and let the loop raise it safely.
+                gainDb = 0f; srcPeaks.clear()
+                // Re-create the global effect so it sits BEFORE the meter in the chain.
+                if (sessions.containsKey(GLOBAL_SESSION)) { detach(GLOBAL_SESSION); attach(GLOBAL_SESSION) }
+                pushGain()
+            }
         } else if (!on && visualizer != null) {
             visualizer?.let { runCatching { it.setEnabled(false); it.release() } }
             visualizer = null

@@ -109,18 +109,15 @@ private fun App() {
 
         // ---------------------------------------------------------- boost
         Section("Volume boost") {
-            Text("+%.1f dB".format(s.boostDb), fontSize = 40.sp, fontWeight = FontWeight.Bold, color = Accent)
+            Text("Up to +%.1f dB".format(s.boostDb), fontSize = 34.sp, fontWeight = FontWeight.Bold, color = Accent)
             Slider(
                 value = s.boostDb, valueRange = 0f..s.maxBoostDb,
                 onValueChange = { update(s.copy(boostDb = it)) }
             )
-            val heavy = s.boostDb > 18f
-            Text(
-                if (heavy) "Still clip-free, but this far up the limiter is doing most of the work: " +
-                        "more boost now means more density, not more peak level. Density/Exciter sound cleaner here."
-                else "Boost goes in before the limiter; Clip Guard keeps output peaks under the ceiling.",
-                fontSize = 12.sp, color = if (heavy) Warn else Color.Gray
-            )
+            Text("Clip Guard raises the volume as far as each song has room for, up to this limit. " +
+                    "It never goes below your normal volume. For more loudness on songs that are already " +
+                    "loud, raise Density: it frees up room and Clip Guard fills it.",
+                fontSize = 12.sp, color = Color.Gray)
             ClipGuardStatus(s)
         }
 
@@ -168,11 +165,11 @@ private fun App() {
             )
             if (!ignoring) Button(onClick = { requestBatteryExemption(ctx) }) { Text("Allow background running") }
             ToggleRow("Global mode (all apps)", s.globalMode) { update(s.copy(globalMode = it)) }
-            ToggleRow("Clip Guard (live crest tracking)", s.clipGuard) { on ->
+            ToggleRow("Clip Guard (measured, clip-free boost)", s.clipGuard) { on ->
                 if (on && !hasMic(ctx)) micPerm.launch(Manifest.permission.RECORD_AUDIO)
                 else update(s.copy(clipGuard = on))
             }
-            if (!s.clipGuard) Text("Off: limiter uses a fixed 18 dB safety margin. Still clip-free, but quieter.",
+            if (!s.clipGuard) Text("Off: boost is applied directly, like other booster apps, and can clip.",
                 fontSize = 12.sp, color = Color.Gray)
             LabeledSlider("Boost slider range", s.maxBoostDb, 12f..48f, "%.0f dB".format(s.maxBoostDb)) {
                 update(s.copy(maxBoostDb = it, boostDb = s.boostDb.coerceAtMost(it)))
@@ -232,19 +229,23 @@ private fun hasMic(ctx: android.content.Context) =
 private fun ClipGuardStatus(s: BoostSettings) {
     var peak by remember { mutableStateOf<Float?>(null) }
     var maxPeak by remember { mutableStateOf(-96f) }
-    var margin by remember { mutableStateOf(18f) }
+    var gain by remember { mutableStateOf(0f) }
     var live by remember { mutableStateOf(false) }
+    var limiting by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         while (true) {
             val e = BoostService.instance?.engine
             peak = e?.lastPeakDb; maxPeak = e?.maxPeakDb ?: -96f
-            margin = e?.crestMarginDb ?: 18f; live = e?.meterAvailable == true
+            gain = e?.gainDb ?: 0f; live = e?.meterAvailable == true
+            limiting = e?.limiterActive == true
             delay(100)
         }
     }
     if (!s.enabled) return
     val p = peak
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (live) Text("Applied now: +%.1f dB".format(gain), color = Color.White, fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold)
         val frac = if (p == null) 0f else ((p + 48f) / 48f).coerceIn(0f, 1f)
         val ceilFrac = ((s.ceilingDb + 48f) / 48f).coerceIn(0f, 1f)
         Box(Modifier.fillMaxWidth().height(10.dp).background(Color(0xFF2A3135), RoundedCornerShape(5.dp))) {
@@ -255,10 +256,16 @@ private fun ClipGuardStatus(s: BoostSettings) {
             }
         }
         Text(
-            if (live && p != null)
-                "Output peak %.1f dBFS · highest %.1f · crest margin %.1f dB".format(p, maxPeak, margin)
-            else "Clip Guard meter off — using fixed %.0f dB safety margin".format(margin),
-            fontSize = 12.sp, color = if (maxPeak >= -0.01f) Color.Red else Color.Gray
+            when {
+                !live -> "Clip Guard is off: boost is applied directly and loud songs CAN clip. " +
+                        "Turn it on (needs the microphone permission) for clip-free boosting."
+                p == null -> "Waiting for audio…"
+                gain < s.boostDb - 0.5f ->
+                    "Output peak %.1f dBFS · the song only has room for +%.1f dB, so that's all that's applied"
+                        .format(p, gain)
+                else -> "Output peak %.1f dBFS · highest %.1f".format(p, maxPeak)
+            } + if (limiting) " · safety limiter active" else "",
+            fontSize = 12.sp, color = if (!live || maxPeak >= -0.01f) Warn else Color.Gray
         )
     }
 }

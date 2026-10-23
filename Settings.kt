@@ -32,7 +32,7 @@ data class BoostSettings(
     val exciterDb: Float = 3f,        // "air"/presence: upward lift of quiet high-frequency detail
     val warmthDb: Float = 0f,         // same idea for the low end
     val globalMode: Boolean = true,   // attach to the global output mix (session 0)
-    val clipGuard: Boolean = true,     // closed-loop crest-factor tracking (see AudioEngine)
+    val clipGuard: Boolean = true,     // measured gain control that keeps peaks under the ceiling (see AudioEngine)
     val bands: List<PeqBand> = DEFAULT_BANDS,
 ) {
     companion object {
