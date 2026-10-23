@@ -1,0 +1,38 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Files were uploaded flat; move them into the Android project layout.
+      - name: Arrange project folders
+        run: |
+          mkdir -p app/src/main/java/com/cleanboost app/src/main/res/values
+          [ -f app.build.gradle.kts ] && mv app.build.gradle.kts app/build.gradle.kts
+          [ -f AndroidManifest.xml ] && mv AndroidManifest.xml app/src/main/
+          [ -f strings.xml ] && mv strings.xml app/src/main/res/values/
+          for f in *.kt; do [ -f "$f" ] && mv "$f" app/src/main/java/com/cleanboost/; done
+          find . -path ./.git -prune -o -type f -print
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CleanBoost-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
